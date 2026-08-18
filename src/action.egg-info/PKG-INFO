@@ -1,0 +1,74 @@
+Metadata-Version: 2.4
+Name: action
+Version: 0.1.0
+Summary: Declarative 2D classical-mechanics animations for Manim
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: numpy>=1.24
+Requires-Dist: scipy>=1.10
+Requires-Dist: sympy>=1.12
+Provides-Extra: manim
+Requires-Dist: manim>=0.18; extra == "manim"
+Provides-Extra: test
+Requires-Dist: pytest>=8; extra == "test"
+
+# Action
+
+`Action` is a small Python library for describing 2D classical mechanisms and playing their solved motion in a normal [Manim](https://www.manim.community/) scene.
+
+## v1 scope
+
+The first vertical slice supports a point-mass pendulum:
+
+- `Wall`, `Rod`, and `Mass`
+- `Hinge` and `Fixed` topology connections
+- uniform downward `Gravity`
+- symbolic Euler-Lagrange equation generation
+- a cached numerical trajectory and Manim animation playback
+
+`Spring` is included as a topology/component primitive with its intrinsic `extension` coordinate, but constrained spring systems, free bodies, multiple walls, and automatic camera/layout are intentionally not solved yet. They raise clear errors rather than returning incorrect mechanics.
+
+## Install
+
+```bash
+python -m pip install -e ".[manim,test]"
+```
+
+## Basic workflow
+
+```python
+from math import pi
+from manim import Scene
+from action import *
+
+class Pendulum(Scene):
+    def construct(self):
+        wall = Wall()
+        mass = Mass(m=1)
+        rod = Rod(length=2)
+
+        hinge = Hinge(wall, rod.start)
+        Fixed(rod.end, mass)
+        Gravity(g=9.81)
+
+        system = System(
+            objects=[wall, mass, rod],
+            initial={hinge.rotation: pi / 4, hinge.rotation.rate: 0},
+        )
+        self.add(system)
+        self.play(system.simulate(10))
+```
+
+The user declares objects, typed mechanical connections, fields, and initial conditions. `System` derives the dependent geometry, generates the equation of motion, solves it once, and presents the cached trajectory through Manim.
+
+Run the included example with:
+
+```bash
+manim -pql examples/pendulum.py Pendulum
+```
+
+## Development
+
+```bash
+python -m pytest
+```
