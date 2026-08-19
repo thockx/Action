@@ -1,2 +1,0 @@
-# This file is used internally by FFMPEG.
-file 'file:C:/Users/thijs/Documents/GitHub/Action/media/videos/double_pendulum/480p15/partial_movie_files/DoublePendulum/2982471169_1195702730_1204040258.mp4'

@@ -1,2 +1,0 @@
-# This file is used internally by FFMPEG.
-file 'file:C:/Users/thijs/Documents/GitHub/Action/validation_renders/videos/validation_scenes/480p15/partial_movie_files/SpringMass/2982471169_2292760581_3095228920.mp4'

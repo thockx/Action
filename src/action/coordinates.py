@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from .context import active_system
+
 
 @dataclass(frozen=True, eq=False)
 class CoordinateRate:
@@ -29,3 +31,14 @@ class Coordinate:
     @property
     def rate(self) -> CoordinateRate:
         return self._rate
+
+    def show(self) -> "Coordinate":
+        system = active_system()
+        if system is None:
+            raise RuntimeError(
+                "Coordinate visualizations must be declared inside a "
+                "'with System() as system:' block."
+            )
+
+        system._register_coordinate_visualization(self)
+        return self

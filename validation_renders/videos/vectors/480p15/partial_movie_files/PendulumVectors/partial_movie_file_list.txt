@@ -1,2 +1,0 @@
-# This file is used internally by FFMPEG.
-file 'file:C:/Users/thijs/Documents/GitHub/Action/validation_renders/videos/vectors/480p15/partial_movie_files/PendulumVectors/2982471169_2000424516_388485438.mp4'

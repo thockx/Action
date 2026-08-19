@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from typing import ClassVar, Protocol, Union
 
 from .components import AttachmentPoint
-from .context import register_connection
+from .context import register_connection, register_field
 from .coordinates import Coordinate
 
 class HasAttachment(Protocol):
@@ -65,6 +65,7 @@ class Gravity:
         if self.g <= 0:
             raise ValueError("Gravity g must be positive.")
         type(self)._active = self
+        register_field(self)
 
     @property
     def vector(self) -> tuple[float, float]:

@@ -1,2 +1,0 @@
-# This file is used internally by FFMPEG.
-file 'file:C:/Users/thijs/Documents/GitHub/Action/examples/media/videos/mass_between_springs/1080p60/partial_movie_files/MassBetweenSprings/2621265332_3851328733_1033768103.mp4'

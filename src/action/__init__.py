@@ -4,6 +4,7 @@ from .components import Mass, Rod, Spring, Wall
 from .connections import Fixed, Gravity, Hinge
 from .coordinates import Coordinate, CoordinateRate
 from .system import System, Trajectory
+from .style import VisualStyle
 from .visualizations import Acceleration, Force, Velocity
 
 __all__ = [
@@ -20,5 +21,6 @@ __all__ = [
     "System",
     "Trajectory",
     "Velocity",
+    "VisualStyle",
     "Wall",
 ]

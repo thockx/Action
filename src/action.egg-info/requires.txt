@@ -1,9 +1,0 @@
-numpy>=1.24
-scipy>=1.10
-sympy>=1.12
-
-[manim]
-manim>=0.18
-
-[test]
-pytest>=8
