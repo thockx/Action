@@ -134,6 +134,7 @@ class Configuration:
 
     def numeric_positions(self, values: np.ndarray) -> dict[int, np.ndarray]:
         substitutions = dict(zip(self.symbols, values))
+        substitutions.update(self.system._parameter_values)
         return {
             node: np.array([float(value.subs(substitutions)) for value in position], dtype=float)
             for node, position in self._symbolic_nodes.items()
@@ -412,6 +413,12 @@ class Configuration:
                         continue
 
                 pivot, angle = selected
+                if (
+                    hinge is not None
+                    and self.system.bar_angle_reference == "geometric"
+                    and pivot is rod.end
+                ):
+                    angle -= sp.pi
                 pivot_node = self.system._node(pivot)
                 other = rod.end if pivot is rod.start else rod.start
                 sign = 1 if pivot is rod.start else -1
@@ -425,7 +432,7 @@ class Configuration:
                 positions[other_node] = (
                     positions[pivot_node]
                     + sign
-                    * rod.length
+                    * self.system._rod_symbols[rod]
                     * sp.Matrix((sp.cos(angle), sp.sin(angle)))
                 )
 
@@ -451,10 +458,13 @@ class Configuration:
         owner = opposite.owner
 
         if isinstance(owner, Rod) and owner is not child_rod:
-            return angles.get(owner)
+            parent_angle = angles.get(owner)
+            if parent_angle is not None and self.system.bar_angle_reference == "geometric":
+                parent_angle = self._rod_ray_angle(owner, opposite, parent_angle)
+            return parent_angle
 
         if isinstance(owner, Wall):
-            return self._hinge_wall_reference_angle(hinge)
+            return self._wall_reference_angle(hinge)
 
         pivot_node = self.system._node(pivot)
         resolved_parent_rods = [
@@ -477,15 +487,57 @@ class Configuration:
         return sp.Integer(0)
 
     @staticmethod
-    def _hinge_wall_reference_angle(
+    def _rod_ray_angle(
+        rod: Rod,
+        endpoint: AttachmentPoint,
+        absolute_angle: sp.Expr,
+    ) -> sp.Expr:
+        if endpoint is rod.end:
+            return absolute_angle + sp.pi
+        return absolute_angle
+
+    def _wall_reference_angle(
+        self,
         hinge: Hinge,
     ) -> sp.Expr:
+        reference = self.system.wall_angle_reference
+
+        if reference == "global_x":
+            return sp.Integer(0)
+
+        if reference == "global_y":
+            return sp.pi / 2
+
+        if reference == "gravity":
+            if not self.system.fields:
+                raise ValueError(
+                    "wall_angle_reference='gravity' requires a gravity field."
+                )
+            return sp.atan2(
+                sp.Float(self.system.fields[0].vector[1]),
+                sp.Float(self.system.fields[0].vector[0]),
+            )
+
         for endpoint in (hinge.first, hinge.second):
             owner = endpoint.owner
             if isinstance(owner, Wall):
-                return sp.pi / 2 if owner.orientation == "vertical" else sp.Integer(0)
+                if reference == "wall_normal":
+                    return sp.Float(owner.rotation) - sp.pi / 2
+
+                return sp.Float(owner.rotation)
 
         return sp.Integer(0)
+
+    def _rod_hinge_pivot(self, rod: Rod) -> AttachmentPoint | None:
+        hinge = self._rod_hinge.get(rod)
+        if hinge is None:
+            return None
+
+        if rod.start in (hinge.first, hinge.second):
+            return rod.start
+        if rod.end in (hinge.first, hinge.second):
+            return rod.end
+        return None
 
     def _validate_all_nodes_resolved(self) -> None:
         unresolved = [

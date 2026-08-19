@@ -1,41 +1,38 @@
 from manim import Scene, WHITE
 from math import pi
-
 from action import *
-
 
 class SpringMass(Scene):
     def construct(self):
         self.camera.background_color = WHITE
         with System(
-            show_equations="lagrangian",
+            show_equations=False,
             equation_dot_notation=True,
+            wall_angle_reference="wall_normal",
+            bar_angle_reference="relative"
         ) as system:
-            wall1 = Wall(orientation="horizontal", position=(0,0))
-            wall2 = Wall(orientation="horizontal", position=(0,-2))
-            mass1 = Mass(m=1, label="m_1")
-            mass2 = Mass(m=1, label="m_2")
-            mass3 = Mass(m=1, label="m_3")
-            spring1 = Spring(k=50, rest_length=1)
+            wall1 = Wall(rotation=0, position=(0,0), size=1)
+            mass1 = Mass(m=1)
+            mass2 = Mass(m=1)
             rod1 = Rod(length=1)
-            rod2 = Rod(length=1)
-            spring2 = Spring(k=100, rest_length=1)
+            rod2= Rod(length=1)
 
-            Fixed(wall1, spring1.start)
-            Fixed(spring1.end, mass1)
-            hinge2 = Hinge(rod1.start, rod2.start)
-            Fixed(mass1, rod1.start)
+            hinge1 = Hinge(wall1, rod1.start)
+            Fixed(rod1.end, mass1)
+            hinge2 = Hinge(mass1, rod2.start)
             Fixed(rod2.end, mass2)
-            Fixed(mass2, spring2.start)
-            Fixed(spring2.end, mass3)
-            hinge1 = Hinge(rod1.end, wall2)
 
             Gravity(g=9.81)
 
-            system.initial = {hinge1.rotation: -135 * pi/180, hinge2.rotation: pi}
+            Velocity(mass1)
+            Force(mass1)
+
+            system.initial = {hinge1.rotation: pi / 2.5}
 
             hinge1.rotation.show()
             hinge2.rotation.show()
+            rod1.length.show()
+            rod2.length.show()
 
         self.add(system)
-        self.play(system.simulate(10))
+        self.play(system.simulate(5))

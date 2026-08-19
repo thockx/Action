@@ -14,6 +14,7 @@ from .configuration import Configuration
 from .connections import Connection, Gravity, Hinge
 from .context import pop_system, push_system
 from .coordinates import Coordinate, CoordinateRate
+from .style import VisualStyle
 
 if TYPE_CHECKING:
     from .visualizations import MassVector
@@ -95,8 +96,28 @@ class System(VGroup):
         show_equations: bool | str | Sequence[str] = False,
         equation_dot_notation: bool = False,
         show_gravity: bool = False,
+        wall_angle_reference: str = "wall",
+        bar_angle_reference: str = "relative",
+        visual_style: VisualStyle | None = None,
     ) -> None:
         super().__init__()
+
+        if wall_angle_reference not in {
+            "wall",
+            "wall_normal",
+            "gravity",
+            "global_x",
+            "global_y",
+        }:
+            raise ValueError(
+                "wall_angle_reference must be one of: wall, wall_normal, "
+                "gravity, global_x, global_y."
+            )
+
+        if bar_angle_reference not in {"relative", "geometric"}:
+            raise ValueError(
+                "bar_angle_reference must be either 'relative' or 'geometric'."
+            )
 
         self.objects = list(objects or [])
         self.initial = dict(initial or {})
@@ -104,6 +125,9 @@ class System(VGroup):
         self.show_equations = show_equations
         self.equation_dot_notation = equation_dot_notation
         self.show_gravity = show_gravity
+        self.wall_angle_reference = wall_angle_reference
+        self.bar_angle_reference = bar_angle_reference
+        self.visual_style = visual_style or VisualStyle()
 
         self._uses_active_gravity = fields is None
         self._context_connections: list[Connection] = []
@@ -117,12 +141,14 @@ class System(VGroup):
         self._vector_samples: dict["MassVector", np.ndarray] = {}
 
         self._coordinate_visualizations: list[Coordinate] = []
+        self._rod_length_visualizations: list[Rod] = []
         self._coordinate_mobjects: dict[Coordinate, object] = {}
         self._hinge_coordinate_visuals: dict[Coordinate, _HingeCoordinateVisual] = {}
 
         self._mass_labels: dict[Mass, str] = {}
         self._mass_symbols: dict[Mass, sp.Symbol] = {}
         self._spring_symbols: dict[Spring, sp.Symbol] = {}
+        self._rod_symbols: dict[Rod, sp.Symbol] = {}
         self._gravity_symbol = sp.Symbol("g", real=True)
         self._parameter_values: dict[sp.Symbol, float] = {}
 
@@ -201,8 +227,29 @@ class System(VGroup):
                 "Cannot add coordinate visualizations after a System has been compiled."
             )
 
+        rod = next(
+            (
+                item
+                for item in self.objects
+                if isinstance(item, Rod) and item.length is coordinate
+            ),
+            None,
+        )
+        if rod is not None:
+            if rod not in self._rod_length_visualizations:
+                self._rod_length_visualizations.append(rod)
+            return
+
         if coordinate not in self._coordinate_visualizations:
             self._coordinate_visualizations.append(coordinate)
+
+    def _register_rod_length_visualization(self, rod: Rod) -> None:
+        if self._compiled:
+            raise RuntimeError(
+                "Cannot add rod length visualizations after a System has been compiled."
+            )
+        if rod not in self._rod_length_visualizations:
+            self._rod_length_visualizations.append(rod)
 
     def _show_all_hinge_coordinates(self) -> None:
         if self._compiled:
@@ -292,7 +339,8 @@ class System(VGroup):
 
         self._trajectory: Trajectory | None = None
 
-        self._scale = 1.0
+        self._view_scale = 1.0
+        self._labels_view_scale = 1.0
         self._origin = np.zeros(2)
 
         self._validate_initial_conditions()
@@ -457,6 +505,7 @@ class System(VGroup):
         self._mass_labels = {}
         self._mass_symbols = {}
         self._spring_symbols = {}
+        self._rod_symbols = {}
         self._parameter_values = {}
 
         mass_total = len(self.masses)
@@ -474,6 +523,13 @@ class System(VGroup):
             symbol = sp.Symbol(symbol_name, real=True, positive=True)
             self._spring_symbols[spring] = symbol
             self._parameter_values[symbol] = float(spring.k)
+
+        rod_total = len(self.rods)
+        for index, rod in enumerate(self.rods, start=1):
+            symbol_name = "ell" if rod_total == 1 else f"ell_{index}"
+            symbol = sp.Symbol(symbol_name, real=True, positive=True)
+            self._rod_symbols[rod] = symbol
+            self._parameter_values[symbol] = float(rod.length)
 
         self._parameter_values[self._gravity_symbol] = (
             float(self.fields[0].g)
@@ -790,7 +846,8 @@ class System(VGroup):
 
         vertical_layout = bool(
             self.walls
-            and self.walls[0].orientation == "horizontal"
+            and abs(np.cos(self.walls[0].rotation))
+            >= abs(np.sin(self.walls[0].rotation))
         )
 
         return {
@@ -1098,9 +1155,11 @@ class System(VGroup):
                 )
 
                 axis = (
-                    np.array((0.0, -1.0))
+                    np.array((
+                        np.sin(wall.rotation),
+                        -np.cos(wall.rotation),
+                    ))
                     if wall is not None
-                    and wall.orientation == "horizontal"
                     else np.array((1.0, 0.0))
                 )
 
@@ -1549,7 +1608,7 @@ class System(VGroup):
     # ------------------------------------------------------------------
 
     def _fit_view(self) -> None:
-        if self._trajectory is None:
+        if self._trajectory is None or not self.visual_style.auto_frame:
             return
 
         points = np.array(
@@ -1569,13 +1628,26 @@ class System(VGroup):
             low + high
         ) / 2
 
-        self._scale = (
-            5.5
-            / max(
-                *(high - low),
-                1.0,
-            )
+        available_size = self.visual_style.frame_size - (
+            2 * self.visual_style.frame_padding
         )
+        if available_size <= 0:
+            raise ValueError(
+                "VisualStyle frame_size must exceed twice frame_padding."
+            )
+
+        self._view_scale = available_size / max(*(high - low), 1.0)
+
+        if self.visual_style.frame_min_scale is not None:
+            self._view_scale = max(
+                self._view_scale,
+                self.visual_style.frame_min_scale,
+            )
+        if self.visual_style.frame_max_scale is not None:
+            self._view_scale = min(
+                self._view_scale,
+                self.visual_style.frame_max_scale,
+            )
 
     # ------------------------------------------------------------------
     # Vector calculations
@@ -1665,7 +1737,7 @@ class System(VGroup):
     ) -> np.ndarray:
 
         transformed = (
-            self._scale
+            self._view_scale
             * (
                 np.array(point)
                 - self._origin
@@ -1680,11 +1752,37 @@ class System(VGroup):
             )
         )
 
+    def _view_length(self, physical_length: float) -> float:
+        return physical_length * self._view_scale
+
+    def _view_stroke_width(self, physical_width: float) -> float:
+        return max(1.0, self._view_length(physical_width) * 10.0)
+
+    def _update_readability_scale(self) -> None:
+        if self._labels_view_scale == self._view_scale:
+            return
+
+        factor = self._view_scale / self._labels_view_scale
+
+        for mobject in self._mass_mobjects.values():
+            mobject[1].scale(factor)
+        for label in self._rod_length_mobjects.values():
+            label.scale(factor)
+        for mobject in self._coordinate_mobjects.values():
+            mobject[3].scale(factor)
+        for mobject in self._vector_mobjects.values():
+            mobject[1].scale(factor)
+
+        self._labels_view_scale = self._view_scale
+
     # ------------------------------------------------------------------
     # Visual creation
     # ------------------------------------------------------------------
 
     def _build_visuals(self) -> None:
+
+        style = self.visual_style
+        mass_radius = self._view_length(style.mass_radius)
 
         # --------------------------------------------------------------
         # Masses
@@ -1693,15 +1791,16 @@ class System(VGroup):
         self._mass_mobjects = {
             mass: VGroup(
                 Circle(
-                    radius=0.25,
-                    color=BLACK,
-                    fill_color=WHITE,
+                    radius=mass_radius,
+                    color=style.mass_color,
+                    fill_color=style.mass_fill_color,
                     fill_opacity=1,
+                    stroke_width=self._view_stroke_width(style.mass_stroke_width),
                 ),
                 MathTex(
                     self._mass_labels[mass],
-                    color=BLACK,
-                ).scale(0.55),
+                    color=style.mass_color,
+                ).scale(style.mass_label_scale),
             )
             for mass in self.masses
         }
@@ -1715,11 +1814,19 @@ class System(VGroup):
                 Line(
                     (0, 0, 0),
                     (1, 0, 0),
-                    color=BLACK,
+                    color=style.rod_color,
                 ),
-                self._attachment_dot(),
+                self._attachment_dot(style.rod_color),
             )
             for rod in self.rods
+        }
+
+        self._rod_length_mobjects = {
+            rod: MathTex(
+                self._rod_length_latex(rod),
+                color=style.rod_color,
+            ).scale(style.rod_label_scale)
+            for rod in self._rod_length_visualizations
         }
 
         # --------------------------------------------------------------
@@ -1728,8 +1835,8 @@ class System(VGroup):
 
         self._spring_mobjects = {
             spring: VGroup(
-                VMobject(color=BLACK),
-                self._attachment_dot(),
+                VMobject(color=style.spring_color),
+                self._attachment_dot(style.spring_color),
             )
             for spring in self.springs
         }
@@ -1739,7 +1846,7 @@ class System(VGroup):
         # --------------------------------------------------------------
 
         self._wall_mobjects = {
-            wall: self._wall_mobject()
+            wall: self._wall_mobject(wall.size)
             for wall in self.walls
         }
 
@@ -1760,7 +1867,7 @@ class System(VGroup):
                 end=np.array((1.0, 0.0, 0.0)),
                 color=visualization.color,
                 buff=0,
-                stroke_width=7,
+                stroke_width=style.vector_stroke_min_width + style.vector_stroke_width,
                 max_tip_length_to_length_ratio=1,
                 max_stroke_width_to_length_ratio=100,
             )
@@ -1768,7 +1875,7 @@ class System(VGroup):
             label = MathTex(
                 self._vector_label(visualization),
                 color=visualization.color,
-            ).scale(0.6)
+            ).scale(style.vector_label_scale)
 
             vector_group = VGroup(
                 arrow,
@@ -1787,33 +1894,33 @@ class System(VGroup):
 
         for coordinate, specification in self._hinge_coordinate_visuals.items():
             arc = Arc(
-                radius=0.2,
+                radius=self._view_length(style.angle_arc_radius),
                 start_angle=0.0,
                 angle=np.pi / 2,
                 arc_center=np.array((0.0, 0.0, 0.0)),
-                color=BLACK,
-                stroke_width=2,
+                color=style.wall_color,
+                stroke_width=self._view_stroke_width(self.visual_style.angle_width),
                 fill_opacity=0,
             )
 
             reference_line = Line(
                 (0.0, 0.0, 0.0),
-                (0.2, 0.0, 0.0),
-                color=BLACK,
-                stroke_width=1.5,
+                (self._view_length(style.angle_arc_radius), 0.0, 0.0),
+                color=style.wall_color,
+                stroke_width=self._view_stroke_width(style.angle_radial_width),
             )
 
             current_line = Line(
                 (0.0, 0.0, 0.0),
-                (0.2, 0.0, 0.0),
-                color=BLACK,
-                stroke_width=1.5,
+                (self._view_length(style.angle_arc_radius), 0.0, 0.0),
+                color=style.wall_color,
+                stroke_width=self._view_stroke_width(style.angle_radial_width),
             )
 
             label = MathTex(
                 specification.label_latex,
-                color=BLACK,
-            ).scale(0.55)
+                color=style.wall_color,
+            ).scale(style.angle_label_scale)
 
             self._coordinate_mobjects[coordinate] = VGroup(
                 arc,
@@ -1842,6 +1949,7 @@ class System(VGroup):
             *self._wall_mobjects.values(),
             *self._spring_mobjects.values(),
             *self._rod_mobjects.values(),
+            *self._rod_length_mobjects.values(),
             *self._mass_mobjects.values(),
             *self._coordinate_mobjects.values(),
             *self._vector_mobjects.values(),
@@ -1879,7 +1987,7 @@ class System(VGroup):
                 MathTex(
                     r"\mathcal{L} = "
                     + self._latex_for_display(lagrangian),
-                    color=BLACK,
+                    color=self.visual_style.wall_color,
                 )
             )
 
@@ -1887,7 +1995,7 @@ class System(VGroup):
             lines.extend(
                 MathTex(
                     self._latex_for_display(equation),
-                    color=BLACK,
+                    color=self.visual_style.wall_color,
                 )
                 for equation in equations
             )
@@ -1895,12 +2003,17 @@ class System(VGroup):
         display = VGroup(*lines).arrange(
             direction=np.array((0.0, -1.0, 0.0)),
             aligned_edge=np.array((-1.0, 0.0, 0.0)),
-            buff=0.08,
+            buff=self.visual_style.equation_line_buffer,
         )
-        display.scale(0.5)
-        if display.width > config.frame_width - 0.5:
-            display.scale_to_fit_width(config.frame_width - 0.5)
-        display.to_edge(np.array((0.0, -1.0, 0.0)), buff=0.2)
+        display.scale(self.visual_style.equation_scale)
+        if display.width > config.frame_width - 2 * self.visual_style.equation_edge_buffer:
+            display.scale_to_fit_width(
+                config.frame_width - 2 * self.visual_style.equation_edge_buffer
+            )
+        display.to_edge(
+            np.array((0.0, -1.0, 0.0)),
+            buff=self.visual_style.equation_edge_buffer,
+        )
         return display
 
     def _equation_sections(self) -> tuple[bool, bool]:
@@ -1997,7 +2110,7 @@ class System(VGroup):
             direction = gravity_vector / magnitude
 
         start = np.array((0.0, 0.0, 0.0))
-        end = start + 0.4 * direction
+        end = start + self.visual_style.gravity_indicator_length * direction
         perpendicular = np.array(
             (
                 -direction[1],
@@ -2011,19 +2124,23 @@ class System(VGroup):
             end=end,
             color=BLACK,
             buff=0,
-            stroke_width=2,
-            max_tip_length_to_length_ratio=0.3,
+            stroke_width=self._view_stroke_width(
+                self.visual_style.gravity_indicator_width
+            ),
+            max_tip_length_to_length_ratio=(
+                self.visual_style.gravity_indicator_tip_ratio
+            ),
         )
 
         label = MathTex(
             "g",
             color=BLACK,
-        ).scale(0.6)
+        ).scale(self.visual_style.gravity_indicator_label_scale)
 
         label.move_to(
             end
-            + 0.1 * direction
-            + 0.1 * perpendicular
+            + self.visual_style.gravity_indicator_offset * direction
+            + self.visual_style.gravity_indicator_offset * perpendicular
         )
 
         indicator = VGroup(
@@ -2033,7 +2150,7 @@ class System(VGroup):
 
         indicator.to_corner(
             np.array((1.0, 1.0, 0.0)),
-            buff=0.35,
+            buff=self.visual_style.gravity_indicator_corner_buffer,
         )
 
         return indicator
@@ -2042,41 +2159,45 @@ class System(VGroup):
     # Wall visual
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _wall_mobject():  # type: ignore[no-untyped-def]
+    def _wall_mobject(self, size: float = 0.9):  # type: ignore[no-untyped-def]
+        style = self.visual_style
+        half_size = self._view_length(size / 2)
+        hatch_count = max(2, int(np.ceil(self.visual_style.hatch_density * size)))
+        tangent = np.array((1.0, 0.0, 0.0))
+        normal = np.array((0.0, 1.0, 0.0))
 
         return VGroup(
             Line(
-                (-0.2, -0.45, 0),
-                (-0.2, 0.45, 0),
-                color=BLACK,
+                -self._view_length(style.wall_support_offset) * tangent
+                - half_size * normal,
+                -self._view_length(style.wall_support_offset) * tangent
+                + half_size * normal,
+                color=style.wall_color,
+                stroke_width=self._view_stroke_width(style.wall_width),
             ),
             *[
                 Line(
-                    (-0.2, value, 0),
-                    (
-                        -0.35,
-                        value - 0.12,
-                        0,
-                    ),
-                    color=BLACK,
-                    stroke_width=1.5,
+                    -self._view_length(style.wall_support_offset) * tangent
+                    + value * normal,
+                    -self._view_length(style.wall_support_offset) * tangent
+                    + value * normal
+                    + self._view_length(style.wall_hatch_length) * normal
+                    - self._view_length(style.wall_hatch_backset) * tangent,
+                    color=style.wall_color,
+                    stroke_width=self._view_stroke_width(style.wall_hatch_width),
                 )
-                for value in np.linspace(
-                    -0.35,
-                    0.35,
-                    5,
+                for value in self._view_length(
+                    np.linspace(-size / 2, size / 2, hatch_count)
                 )
             ],
         )
 
-    @staticmethod
-    def _attachment_dot():  # type: ignore[no-untyped-def]
+    def _attachment_dot(self, color: str):  # type: ignore[no-untyped-def]
 
         return Circle(
-            radius=0.055,
-            color=BLACK,
-            fill_color=BLACK,
+            radius=self._view_length(self.visual_style.attachment_radius),
+            color=color,
+            fill_color=color,
             fill_opacity=1,
         ).set_opacity(0)
 
@@ -2092,6 +2213,11 @@ class System(VGroup):
         }[
             visualization.quantity
         ]
+
+    def _rod_length_latex(self, rod: Rod) -> str:
+        if len(self.rods) == 1:
+            return r"\ell"
+        return rf"\ell_{self.rods.index(rod) + 1}"
 
     @staticmethod
     def _normalize_2d(
@@ -2134,24 +2260,45 @@ class System(VGroup):
         geometry: dict[object, tuple[float, float]],
     ) -> np.ndarray:
         if specification.parent_rod is None:
-            if (
-                specification.wall is not None
-                and specification.wall.orientation == "vertical"
-            ):
-                return np.array((0.0, 1.0))
+            if specification.wall is None:
+                return np.array((1.0, 0.0))
 
-            return np.array((1.0, 0.0))
+            angle = self.configuration._wall_reference_angle(
+                specification.hinge,
+            )
+            return np.array((
+                float(sp.cos(angle)),
+                float(sp.sin(angle)),
+            ))
 
-        return self._rod_direction(
-            specification.parent_rod,
-            geometry,
-        )
+        if self.bar_angle_reference == "geometric":
+            return self._rod_direction_from_pivot(
+                specification.parent_rod,
+                specification.pivot,
+                geometry,
+            )
+
+        return self._rod_direction(specification.parent_rod, geometry)
 
     def _coordinate_current_direction(
         self,
         specification: _HingeCoordinateVisual,
         geometry: dict[object, tuple[float, float]],
     ) -> np.ndarray:
+        if specification.parent_rod is None:
+            return self._rod_direction_from_pivot(
+                specification.child_rod,
+                specification.pivot,
+                geometry,
+            )
+
+        if self.bar_angle_reference == "geometric":
+            return self._rod_direction_from_pivot(
+                specification.child_rod,
+                specification.pivot,
+                geometry,
+            )
+
         return self._rod_direction(specification.child_rod, geometry)
 
     def _rod_direction(
@@ -2197,39 +2344,11 @@ class System(VGroup):
             )
         )
 
-        normal_axis = 0 if wall.orientation == "vertical" else 1
         hatch_side = self._wall_hatch_side(wall, geometry)
-        return bool(midpoint[normal_axis] * hatch_side > 1e-8)
-
-    def _coordinate_radius(
-        self,
-        specification: _HingeCoordinateVisual,
-        geometry: dict[object, tuple[float, float]],
-    ) -> float:
-        pivot = self._visual_point(
-            geometry[specification.pivot]
+        normal = np.array(
+            (-np.sin(wall.rotation), np.cos(wall.rotation))
         )
-
-        distances: list[float] = []
-        for point in self._points():
-            if self._node(point) != self._node(specification.pivot):
-                continue
-
-            owner = point.owner
-            if isinstance(owner, Rod):
-                other = owner.end if point is owner.start else owner.start
-                other_point = self._visual_point(
-                    geometry[other]
-                )
-                distances.append(
-                    float(np.linalg.norm(other_point - pivot))
-                )
-
-        positive = [value for value in distances if value > 1e-8]
-        if not positive:
-            return 0.35
-
-        return float(np.clip(min(positive) * 0.35, 0.22, 0.55))
+        return bool(np.dot(midpoint, normal) * hatch_side > 1e-8)
 
     # ------------------------------------------------------------------
     # Attachment dots
@@ -2257,6 +2376,7 @@ class System(VGroup):
         )
 
         dot = mobject[1]
+        dot.set(width=2 * self._view_length(self.visual_style.attachment_radius))
 
         if point is None:
             dot.set_opacity(0)
@@ -2332,17 +2452,10 @@ class System(VGroup):
             else np.array((1.0, 0.0))
         )
 
-        normal_axis = (
-            0
-            if wall.orientation == "vertical"
-            else 1
+        normal = np.array(
+            (-np.sin(wall.rotation), np.cos(wall.rotation))
         )
-
-        return (
-            -1.0
-            if direction[normal_axis] >= 0
-            else 1.0
-        )
+        return -1.0 if np.dot(direction, normal) >= 0 else 1.0
 
     # ------------------------------------------------------------------
     # Visual updates
@@ -2357,6 +2470,7 @@ class System(VGroup):
             return
 
         geometry = self.geometry_at(time)
+        self._update_readability_scale()
 
         # --------------------------------------------------------------
         # Walls
@@ -2368,94 +2482,49 @@ class System(VGroup):
                 geometry[wall]
             )
 
+            half_size = self._view_length(wall.size / 2)
+            hatch_count = max(
+                2,
+                int(np.ceil(self.visual_style.hatch_density * wall.size)),
+            )
+
             hatch_side = self._wall_hatch_side(
                 wall,
                 geometry,
             )
 
-            if wall.orientation == "vertical":
-
-                support_start = (
-                    attachment
-                    + np.array(
-                        (0.0, -0.45, 0.0)
-                    )
+            tangent = np.array((
+                np.cos(wall.rotation),
+                np.sin(wall.rotation),
+                0.0,
+            ))
+            normal = np.array((
+                -np.sin(wall.rotation),
+                np.cos(wall.rotation),
+                0.0,
+            ))
+            support_start = attachment - half_size * tangent
+            support_end = attachment + half_size * tangent
+            hatch_starts = [
+                attachment + offset * tangent
+                for offset in np.linspace(-half_size, half_size, hatch_count)
+            ]
+            hatch_ends = [
+                start
+                + hatch_side * (
+                    self._view_length(self.visual_style.wall_hatch_length) * normal
+                    - self._view_length(self.visual_style.wall_hatch_backset) * tangent
                 )
-
-                support_end = (
-                    attachment
-                    + np.array(
-                        (0.0, 0.45, 0.0)
-                    )
-                )
-
-                hatch_starts = [
-                    attachment
-                    + np.array(
-                        (0.0, offset, 0.0)
-                    )
-                    for offset in np.linspace(
-                        -0.35,
-                        0.35,
-                        5,
-                    )
-                ]
-
-                hatch_ends = [
-                    start
-                    + np.array(
-                        (
-                            0.15 * hatch_side,
-                            -0.12,
-                            0.0,
-                        )
-                    )
-                    for start in hatch_starts
-                ]
-
-            else:
-
-                support_start = (
-                    attachment
-                    + np.array(
-                        (-0.45, 0.0, 0.0)
-                    )
-                )
-
-                support_end = (
-                    attachment
-                    + np.array(
-                        (0.45, 0.0, 0.0)
-                    )
-                )
-
-                hatch_starts = [
-                    attachment
-                    + np.array(
-                        (offset, 0.0, 0.0)
-                    )
-                    for offset in np.linspace(
-                        -0.35,
-                        0.35,
-                        5,
-                    )
-                ]
-
-                hatch_ends = [
-                    start
-                    + np.array(
-                        (
-                            -0.12,
-                            0.15 * hatch_side,
-                            0.0,
-                        )
-                    )
-                    for start in hatch_starts
-                ]
+                for start in hatch_starts
+            ]
 
             mobject[0].put_start_and_end_on(
                 support_start,
                 support_end,
+            )
+            mobject[0].set_stroke(
+                width=self._view_stroke_width(self.visual_style.wall_width),
+                color=self.visual_style.wall_color,
             )
 
             for hatch, start, end in zip(
@@ -2466,6 +2535,10 @@ class System(VGroup):
                 hatch.put_start_and_end_on(
                     start,
                     end,
+                )
+                hatch.set_stroke(
+                    width=self._view_stroke_width(self.visual_style.wall_hatch_width),
+                    color=self.visual_style.wall_color,
                 )
 
         # --------------------------------------------------------------
@@ -2482,6 +2555,10 @@ class System(VGroup):
                     geometry[rod.end]
                 ),
             )
+            mobject[0].set_stroke(
+                width=self._view_stroke_width(self.visual_style.rod_width),
+                color=self.visual_style.rod_color,
+            )
 
             self._update_attachment_dot(
                 mobject,
@@ -2490,11 +2567,30 @@ class System(VGroup):
                 geometry,
             )
 
+            label = self._rod_length_mobjects.get(rod)
+            if label is not None:
+                start = self._visual_point(geometry[rod.start])
+                end = self._visual_point(geometry[rod.end])
+                direction = end - start
+                normal = self._normalize_2d(
+                    np.array((-direction[1], direction[0]))
+                )
+                label.move_to(
+                    0.5 * (start + end)
+                    + self._view_length(self.visual_style.angle_label_offset)
+                    * np.array((*normal, 0.0))
+                )
+
         # --------------------------------------------------------------
         # Springs
         # --------------------------------------------------------------
 
         for spring, mobject in self._spring_mobjects.items():
+
+            mobject[0].set_stroke(
+                width=self._view_stroke_width(self.visual_style.spring_width),
+                color=self.visual_style.spring_color,
+            )
 
             self._spring_points(
                 mobject[0],
@@ -2518,6 +2614,13 @@ class System(VGroup):
         # --------------------------------------------------------------
 
         for mass, mobject in self._mass_mobjects.items():
+
+            mobject[0].set(width=2 * self._view_length(self.visual_style.mass_radius))
+            mobject[0].set_stroke(
+                width=self._view_stroke_width(self.visual_style.mass_stroke_width),
+                color=self.visual_style.mass_color,
+            )
+            mobject[0].set_fill(color=self.visual_style.mass_fill_color)
 
             mobject.move_to(
                 self._visual_point(
@@ -2570,10 +2673,7 @@ class System(VGroup):
                 geometry[specification.pivot]
             )
 
-            radius = self._coordinate_radius(
-                specification,
-                geometry,
-            )
+            radius = self._view_length(self.visual_style.angle_arc_radius)
 
             reference_3d = np.array(
                 (
@@ -2603,14 +2703,21 @@ class System(VGroup):
                 start_angle=start_angle,
                 angle=sweep,
                 arc_center=center,
-                color=BLACK,
-                stroke_width=2,
+                color=self.visual_style.wall_color,
+                stroke_width=self._view_stroke_width(self.visual_style.angle_width),
                 fill_opacity=0,
             )
 
             group[0].become(arc)
-
-            radial_extension = 0.1
+            group[1].set_stroke(
+                width=self._view_stroke_width(self.visual_style.angle_radial_width)
+            )
+            group[2].set_stroke(
+                width=self._view_stroke_width(self.visual_style.angle_radial_width)
+            )
+            radial_extension = self._view_length(
+                self.visual_style.angle_radial_extension
+            )
 
             group[1].put_start_and_end_on(
                 center,
@@ -2621,9 +2728,17 @@ class System(VGroup):
                 center,
                 center + (radius + radial_extension) * current_3d,
             )
+            group[1].set_stroke(
+                width=self._view_stroke_width(self.visual_style.angle_radial_width)
+            )
+            group[2].set_stroke(
+                width=self._view_stroke_width(self.visual_style.angle_radial_width)
+            )
 
             mid_angle = start_angle + 0.5 * sweep
-            label_radius = radius + 0.16
+            label_radius = radius + self._view_length(
+                self.visual_style.angle_label_offset
+            )
 
             group[3].move_to(
                 center
@@ -2716,10 +2831,12 @@ class System(VGroup):
             # Scale all arrow dimensions from the same trajectory-normalized
             # magnitude. The peak vector receives the current maximum styling.
             arrow.set_stroke(
-                width=2.5 + 4.5 * normalized_magnitude
+                width=self.visual_style.vector_stroke_min_width
+                + self.visual_style.vector_stroke_width * normalized_magnitude
             )
             arrow.tip.scale_to_fit_width(
-                0.08 + 0.28 * normalized_magnitude
+                self.visual_style.vector_tip_min_width
+                + self.visual_style.vector_tip_extra_width * normalized_magnitude
             )
 
             # ----------------------------------------------------------
@@ -2752,8 +2869,16 @@ class System(VGroup):
 
             label_position = (
                 end
-                + direction * (0.1 + 0.12 * normalized_magnitude)
-                + perpendicular * (0.08 + 0.08 * normalized_magnitude)
+                + direction * (
+                    self.visual_style.vector_label_forward_offset
+                    + self.visual_style.vector_label_forward_extra
+                    * normalized_magnitude
+                )
+                + perpendicular * (
+                    self.visual_style.vector_label_side_offset
+                    + self.visual_style.vector_label_side_extra
+                    * normalized_magnitude
+                )
             )
 
             label = group[1]
@@ -2772,8 +2897,8 @@ class System(VGroup):
     # Spring geometry
     # ------------------------------------------------------------------
 
-    @staticmethod
     def _spring_points(
+        self,
         mobject,
         start: np.ndarray,
         end: np.ndarray,
@@ -2802,7 +2927,7 @@ class System(VGroup):
         )
 
         lead = min(
-            0.25,
+            self._view_length(self.visual_style.spring_lead_length),
             length / 5,
         )
 
@@ -2816,9 +2941,9 @@ class System(VGroup):
             + vector * fraction
             + normal
             * (
-                0.12
+                self._view_length(self.visual_style.spring_amplitude)
                 if index % 2
-                else -0.12
+                else -self._view_length(self.visual_style.spring_amplitude)
             )
             for index, fraction
             in enumerate(

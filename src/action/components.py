@@ -8,6 +8,27 @@ from typing import TYPE_CHECKING
 from .context import register_object
 from .coordinates import Coordinate
 
+
+class RodLength(float):
+    def __new__(cls, value: float, rod: "Rod | None" = None):
+        instance = float.__new__(cls, value)
+        instance.rod = rod
+        return instance
+
+    def show(self) -> "RodLength":
+        from .context import active_system
+
+        system = active_system()
+        if system is None:
+            raise RuntimeError(
+                "Length visualizations must be declared inside a "
+                "'with System() as system:' block."
+            )
+        if self.rod is None:
+            raise RuntimeError("Only a Rod's length can be shown.")
+        system._register_rod_length_visualization(self.rod)
+        return self
+
 if TYPE_CHECKING:
     from .connections import Connection
 
@@ -51,6 +72,7 @@ class Rod:
             raise ValueError("Rod length must be positive.")
         if self.m < 0:
             raise ValueError("Rod mass cannot be negative.")
+        object.__setattr__(self, "length", RodLength(self.length, self))
         self.start = AttachmentPoint(self, "start")
         self.end = AttachmentPoint(self, "end")
         register_object(self)
@@ -61,13 +83,15 @@ class Wall:
     """A stationary visual support and attachment location in SI coordinates."""
 
     position: tuple[float, float] | None = None
-    orientation: str = "horizontal"
-    angle: float = 0.0
+    rotation: float = 0.0
+    size: float = 0.9
     attachment: AttachmentPoint = field(init=False)
 
     def __post_init__(self) -> None:
-        if self.orientation not in {"vertical", "horizontal"}:
-            self.orientation = "horizontal"
+        if not isinstance(self.rotation, (int, float)):
+            raise ValueError("Wall rotation must be specified in radians.")
+        if self.size <= 0:
+            raise ValueError("Wall size must be positive.")
         self.attachment = AttachmentPoint(self, "attachment")
         register_object(self)
 
