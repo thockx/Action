@@ -1,2 +1,0 @@
-# This file is used internally by FFMPEG.
-file 'file:C:/Users/thijs/Documents/GitHub/Action/examples/media/videos/coupled_springs/1080p60/partial_movie_files/CoupledSprings/2621265332_564920739_256366455.mp4'

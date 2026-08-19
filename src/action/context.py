@@ -6,7 +6,7 @@ from contextvars import ContextVar
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from .connections import Connection
+    from .connections import Connection, Gravity
     from .system import System
 
 
@@ -35,3 +35,9 @@ def register_connection(connection: "Connection") -> None:
     system = active_system()
     if system is not None:
         system._register_connection(connection)
+
+
+def register_field(field: "Gravity") -> None:
+    system = active_system()
+    if system is not None:
+        system._register_field(field)

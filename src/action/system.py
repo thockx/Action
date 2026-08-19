@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Mapping
+from typing import TYPE_CHECKING, Mapping, Sequence
 
 import numpy as np
 import sympy as sp
@@ -21,6 +21,7 @@ if TYPE_CHECKING:
 try:
     from manim import (
         Animation,
+        Arc,
         Arrow,
         BLACK,
         Circle,
@@ -56,6 +57,33 @@ class Trajectory:
         )
 
 
+@dataclass(frozen=True)
+class _HingeCoordinateVisual:
+    coordinate: Coordinate
+    hinge: Hinge
+    child_rod: Rod
+    parent_rod: Rod | None
+    wall: Wall | None
+    pivot: AttachmentPoint
+    child_endpoint: AttachmentPoint
+    label_latex: str
+
+
+class CoordinateCollection(tuple):
+    def __new__(
+        cls,
+        coordinates: tuple[Coordinate, ...],
+        system: "System",
+    ) -> "CoordinateCollection":
+        instance = super().__new__(cls, coordinates)
+        instance._system = system
+        return instance
+
+    def show(self) -> "CoordinateCollection":
+        self._system._show_all_hinge_coordinates()
+        return self
+
+
 class System(VGroup):
     """A Manim-compatible 2D mechanism with one shared Lagrangian pipeline."""
 
@@ -64,7 +92,9 @@ class System(VGroup):
         objects: list[object] | None = None,
         initial: Mapping[Coordinate | CoordinateRate, float] | None = None,
         fields: list[Gravity] | None = None,
-        show_equations: bool = False,
+        show_equations: bool | str | Sequence[str] = False,
+        equation_dot_notation: bool = False,
+        show_gravity: bool = False,
     ) -> None:
         super().__init__()
 
@@ -72,9 +102,12 @@ class System(VGroup):
         self.initial = dict(initial or {})
         self.fields = list(fields) if fields is not None else []
         self.show_equations = show_equations
+        self.equation_dot_notation = equation_dot_notation
+        self.show_gravity = show_gravity
 
         self._uses_active_gravity = fields is None
         self._context_connections: list[Connection] = []
+        self._context_fields: list[Gravity] = []
 
         # Vector visualizations.
         self._visualizations: list["MassVector"] = []
@@ -82,6 +115,16 @@ class System(VGroup):
         self._vector_scales: dict["MassVector", float] = {}
         self._vector_max_magnitudes: dict["MassVector", float] = {}
         self._vector_samples: dict["MassVector", np.ndarray] = {}
+
+        self._coordinate_visualizations: list[Coordinate] = []
+        self._coordinate_mobjects: dict[Coordinate, object] = {}
+        self._hinge_coordinate_visuals: dict[Coordinate, _HingeCoordinateVisual] = {}
+
+        self._mass_labels: dict[Mass, str] = {}
+        self._mass_symbols: dict[Mass, sp.Symbol] = {}
+        self._spring_symbols: dict[Spring, sp.Symbol] = {}
+        self._gravity_symbol = sp.Symbol("g", real=True)
+        self._parameter_values: dict[sp.Symbol, float] = {}
 
         self._context_token = None
         self._compiled = False
@@ -149,6 +192,55 @@ class System(VGroup):
 
         self._visualizations.append(visualization)
 
+    def _register_coordinate_visualization(
+        self,
+        coordinate: Coordinate,
+    ) -> None:
+        if self._compiled:
+            raise RuntimeError(
+                "Cannot add coordinate visualizations after a System has been compiled."
+            )
+
+        if coordinate not in self._coordinate_visualizations:
+            self._coordinate_visualizations.append(coordinate)
+
+    def _show_all_hinge_coordinates(self) -> None:
+        if self._compiled:
+            raise RuntimeError(
+                "Cannot add coordinate visualizations after a System has been compiled."
+            )
+
+        for coordinate in self._available_hinge_coordinates():
+            self._register_coordinate_visualization(coordinate)
+
+    def _available_hinge_coordinates(self) -> tuple[Coordinate, ...]:
+        hinges = (
+            [
+                connection
+                for connection in self.connections
+                if isinstance(connection, Hinge)
+            ]
+            if hasattr(self, "connections")
+            else [
+                connection
+                for connection in self._context_connections
+                if isinstance(connection, Hinge)
+            ]
+        )
+
+        return tuple(
+            hinge.rotation
+            for hinge in hinges
+        )
+
+    def _register_field(self, field: Gravity) -> None:
+        if self._compiled:
+            raise RuntimeError(
+                "Cannot add fields after a System has been compiled."
+            )
+
+        self._context_fields.append(field)
+
     # ------------------------------------------------------------------
     # Compilation
     # ------------------------------------------------------------------
@@ -157,8 +249,11 @@ class System(VGroup):
         if self._compiled:
             return
 
-        if self._uses_active_gravity:
-            self.fields = [Gravity.active()]
+        if self._context_fields:
+            self.fields = [self._context_fields[-1]]
+        elif self._uses_active_gravity and not self.fields and Gravity._active is not None:
+            # Preserve standalone Gravity(...) declarations for subsequently created systems.
+            self.fields = [Gravity._active]
 
         self.masses = [
             item for item in self.objects
@@ -187,10 +282,13 @@ class System(VGroup):
             if isinstance(item, Wall)
         ]
 
+        self._prepare_component_symbols()
+
         self.connections = self._collect_connections()
         self._node_by_point = self._make_nodes()
 
         self.configuration = Configuration(self)
+        self._prepare_hinge_coordinate_visuals()
 
         self._trajectory: Trajectory | None = None
 
@@ -211,15 +309,23 @@ class System(VGroup):
             self._bias,
         ) = self._equation_terms()
 
+        mass_matrix_numeric = self._mass_matrix.subs(
+            self._parameter_values,
+        )
+
+        bias_numeric = self._bias.subs(
+            self._parameter_values,
+        )
+
         self._mass_matrix_fn = sp.lambdify(
             [*self._q, *self._dq],
-            self._mass_matrix,
+            mass_matrix_numeric,
             "numpy",
         )
 
         self._bias_fn = sp.lambdify(
             [*self._q, *self._dq],
-            self._bias,
+            bias_numeric,
             "numpy",
         )
 
@@ -234,12 +340,24 @@ class System(VGroup):
     # ------------------------------------------------------------------
 
     @property
-    def coordinates(self) -> tuple[Coordinate, ...]:
-        """All exposed intrinsic coordinates, including spring extensions."""
+    def coordinates(self) -> CoordinateCollection:
+        """Independent generalized coordinates used by the solver."""
 
-        return (
-            *self.configuration.intrinsic_coordinates,
-            *(spring.extension for spring in self.springs),
+        if not self._compiled and not hasattr(self, "configuration"):
+            hinge_coordinates = [
+                connection.rotation
+                for connection in self._context_connections
+                if isinstance(connection, Hinge)
+            ]
+
+            return CoordinateCollection(
+                tuple(hinge_coordinates),
+                self,
+            )
+
+        return CoordinateCollection(
+            self.configuration.intrinsic_coordinates,
+            self,
         )
 
     @property
@@ -247,13 +365,57 @@ class System(VGroup):
         return len(self._q)
 
     def equations_of_motion(self) -> tuple[sp.Equality, ...]:
+        functions, time = self._equation_coordinate_functions(
+            dot_notation=False,
+        )
+
+        lagrangian = self._lagrangian_with_time_functions(
+            functions,
+            time,
+        )
+
+        return self._euler_lagrange_equations(
+            functions,
+            lagrangian,
+            time,
+        )
+
+    def _equation_coordinate_functions(
+        self,
+        dot_notation: bool,
+    ) -> tuple[list[sp.Expr], sp.Symbol]:
         time = sp.symbols("t", real=True)
 
-        functions = [
-            sp.Function(str(value))(time)
-            for value in self._q
-        ]
+        if dot_notation:
+            from sympy.physics.vector import dynamicsymbols
 
+            time = dynamicsymbols._t
+
+            return (
+                list(
+                dynamicsymbols(
+                    [
+                        str(value)
+                        for value in self._q
+                    ]
+                )
+                ),
+                time,
+            )
+
+        return (
+            [
+                sp.Function(str(value))(time)
+                for value in self._q
+            ],
+            time,
+        )
+
+    def _lagrangian_with_time_functions(
+        self,
+        functions: list[sp.Expr],
+        time: sp.Symbol,
+    ) -> sp.Expr:
         mapping = (
             dict(zip(self._q, functions))
             | dict(
@@ -264,10 +426,16 @@ class System(VGroup):
             )
         )
 
-        lagrangian = (
+        return (
             self._kinetic - self._potential
         ).subs(mapping)
 
+    @staticmethod
+    def _euler_lagrange_equations(
+        functions: list[sp.Expr],
+        lagrangian: sp.Expr,
+        time: sp.Symbol,
+    ) -> tuple[sp.Equality, ...]:
         return tuple(
             sp.Eq(
                 sp.simplify(
@@ -284,6 +452,185 @@ class System(VGroup):
             )
             for value in functions
         )
+
+    def _prepare_component_symbols(self) -> None:
+        self._mass_labels = {}
+        self._mass_symbols = {}
+        self._spring_symbols = {}
+        self._parameter_values = {}
+
+        mass_total = len(self.masses)
+        for index, mass in enumerate(self.masses, start=1):
+            label = "m" if mass_total == 1 else f"m_{{{index}}}"
+            symbol_name = "m" if mass_total == 1 else f"m_{index}"
+            symbol = sp.Symbol(symbol_name, real=True, positive=True)
+            self._mass_labels[mass] = label
+            self._mass_symbols[mass] = symbol
+            self._parameter_values[symbol] = float(mass.m)
+
+        spring_total = len(self.springs)
+        for index, spring in enumerate(self.springs, start=1):
+            symbol_name = "k" if spring_total == 1 else f"k_{index}"
+            symbol = sp.Symbol(symbol_name, real=True, positive=True)
+            self._spring_symbols[spring] = symbol
+            self._parameter_values[symbol] = float(spring.k)
+
+        self._parameter_values[self._gravity_symbol] = (
+            float(self.fields[0].g)
+            if self.fields
+            else 0.0
+        )
+
+    def _prepare_hinge_coordinate_visuals(self) -> None:
+        self._hinge_coordinate_visuals = {}
+
+        if not self._coordinate_visualizations:
+            return
+
+        hinges = [
+            connection
+            for connection in self.connections
+            if isinstance(connection, Hinge)
+        ]
+
+        hinge_by_rotation = {
+            hinge.rotation: hinge
+            for hinge in hinges
+        }
+
+        hinge_by_rod_rotation: dict[Coordinate, Hinge] = {}
+        for rod, hinge in self.configuration._rod_hinge.items():
+            if hinge is not None:
+                hinge_by_rod_rotation[rod.rotation] = hinge
+
+        symbol_by_coordinate = {
+            spec.intrinsic: spec.symbol
+            for spec in self.configuration.specs
+            if isinstance(spec.intrinsic, Coordinate)
+        }
+
+        for requested in self._coordinate_visualizations:
+            hinge = (
+                hinge_by_rotation.get(requested)
+                or hinge_by_rod_rotation.get(requested)
+            )
+
+            if hinge is None:
+                raise ValueError(
+                    "Coordinate visualization currently supports only "
+                    "hinge rotation coordinates."
+                )
+
+            coordinate = hinge.rotation
+            if coordinate in self._hinge_coordinate_visuals:
+                continue
+
+            child_rod = self._hinge_child_rod(hinge)
+            if child_rod is None:
+                raise ValueError(
+                    "Cannot draw hinge coordinate: no controlled rod "
+                    "was found for the hinge."
+                )
+
+            pivot, child_endpoint = self._hinge_pivot_and_child_endpoint(
+                hinge,
+                child_rod,
+            )
+
+            parent_rod = self._parent_rod_at_pivot(
+                pivot,
+                child_rod,
+            )
+
+            opposite = (
+                hinge.second
+                if pivot is hinge.first
+                else hinge.first
+            )
+
+            if isinstance(opposite.owner, Rod) and opposite.owner is not child_rod:
+                parent_rod = opposite.owner
+
+            wall = self._hinge_wall(
+                hinge,
+            )
+
+            symbol = symbol_by_coordinate.get(
+                coordinate,
+                sp.Symbol("theta", real=True),
+            )
+
+            self._hinge_coordinate_visuals[coordinate] = _HingeCoordinateVisual(
+                coordinate=coordinate,
+                hinge=hinge,
+                child_rod=child_rod,
+                parent_rod=parent_rod,
+                wall=wall,
+                pivot=pivot,
+                child_endpoint=child_endpoint,
+                label_latex=sp.latex(symbol),
+            )
+
+    @staticmethod
+    def _hinge_wall(
+        hinge: Hinge,
+    ) -> Wall | None:
+        for endpoint in (hinge.first, hinge.second):
+            owner = endpoint.owner
+            if isinstance(owner, Wall):
+                return owner
+
+        return None
+
+    def _hinge_child_rod(
+        self,
+        hinge: Hinge,
+    ) -> Rod | None:
+        for rod, rod_hinge in self.configuration._rod_hinge.items():
+            if rod_hinge is hinge:
+                return rod
+        return None
+
+    @staticmethod
+    def _hinge_pivot_and_child_endpoint(
+        hinge: Hinge,
+        rod: Rod,
+    ) -> tuple[AttachmentPoint, AttachmentPoint]:
+        pivot = (
+            rod.start
+            if rod.start in (hinge.first, hinge.second)
+            else rod.end
+        )
+
+        child_endpoint = (
+            rod.end
+            if pivot is rod.start
+            else rod.start
+        )
+
+        return pivot, child_endpoint
+
+    def _parent_rod_at_pivot(
+        self,
+        pivot: AttachmentPoint,
+        child_rod: Rod,
+    ) -> Rod | None:
+        pivot_node = self._node(pivot)
+
+        for point in self._points():
+            if self._node(point) != pivot_node:
+                continue
+
+            owner = point.owner
+            if not isinstance(owner, Rod):
+                continue
+
+            if owner is child_rod:
+                continue
+
+            return owner
+
+        return None
 
     # ------------------------------------------------------------------
     # Numerical simulation
@@ -472,9 +819,20 @@ class System(VGroup):
 
         allowed = set(self.coordinates)
 
+        # Spring extensions are exposed inputs, but not generalized coordinates.
+        allowed |= {
+            spring.extension
+            for spring in self.springs
+        }
+
         allowed |= {
             coordinate.rate
             for coordinate in self.coordinates
+        }
+
+        allowed |= {
+            spring.extension.rate
+            for spring in self.springs
         }
 
         invalid = set(self.initial).difference(allowed)
@@ -687,6 +1045,17 @@ class System(VGroup):
             node = self._node(
                 mass.attachment
             )
+
+            mass_coordinates = self.configuration._mass_intrinsics.get(mass)
+            if mass_coordinates is not None and all(
+                coordinate in self.initial
+                for coordinate in mass_coordinates
+            ):
+                start = self.configuration.symbols.index(
+                    self.configuration._mass_symbols[mass][0]
+                )
+                known[node] = q[start:start + 2]
+                continue
 
             anchors: list[
                 tuple[
@@ -1052,16 +1421,17 @@ class System(VGroup):
             )
 
             kinetic += (
-                mass.m
+                self._mass_symbols[mass]
                 * velocity.dot(velocity)
                 / 2
             )
 
-            potential += (
-                mass.m
-                * self.fields[0].g
-                * position[1]
-            )
+            if self.fields:
+                potential += (
+                    self._mass_symbols[mass]
+                    * self._gravity_symbol
+                    * position[1]
+                )
 
         for spring in self.springs:
             delta = (
@@ -1074,7 +1444,7 @@ class System(VGroup):
             )
 
             potential += (
-                spring.k
+                self._spring_symbols[spring]
                 * (
                     sp.sqrt(
                         delta.dot(delta)
@@ -1329,7 +1699,7 @@ class System(VGroup):
                     fill_opacity=1,
                 ),
                 MathTex(
-                    mass.label,
+                    self._mass_labels[mass],
                     color=BLACK,
                 ).scale(0.55),
             )
@@ -1409,9 +1779,58 @@ class System(VGroup):
 
             self._vector_mobjects[visualization] = vector_group
 
+        # --------------------------------------------------------------
+        # Coordinate visuals (hinge rotations)
+        # --------------------------------------------------------------
+
+        self._coordinate_mobjects = {}
+
+        for coordinate, specification in self._hinge_coordinate_visuals.items():
+            arc = Arc(
+                radius=0.2,
+                start_angle=0.0,
+                angle=np.pi / 2,
+                arc_center=np.array((0.0, 0.0, 0.0)),
+                color=BLACK,
+                stroke_width=2,
+                fill_opacity=0,
+            )
+
+            reference_line = Line(
+                (0.0, 0.0, 0.0),
+                (0.2, 0.0, 0.0),
+                color=BLACK,
+                stroke_width=1.5,
+            )
+
+            current_line = Line(
+                (0.0, 0.0, 0.0),
+                (0.2, 0.0, 0.0),
+                color=BLACK,
+                stroke_width=1.5,
+            )
+
+            label = MathTex(
+                specification.label_latex,
+                color=BLACK,
+            ).scale(0.55)
+
+            self._coordinate_mobjects[coordinate] = VGroup(
+                arc,
+                reference_line,
+                current_line,
+                label,
+            )
+
         self._equation_mobject = (
             self._equation_display()
             if self.show_equations
+            else None
+        )
+
+        self._gravity_mobject = (
+            self._gravity_indicator()
+            if (self.show_gravity or bool(self._context_fields)) and bool(self.fields)
             else None
         )
 
@@ -1424,37 +1843,200 @@ class System(VGroup):
             *self._spring_mobjects.values(),
             *self._rod_mobjects.values(),
             *self._mass_mobjects.values(),
+            *self._coordinate_mobjects.values(),
             *self._vector_mobjects.values(),
             *([self._equation_mobject] if self._equation_mobject is not None else []),
+            *([self._gravity_mobject] if self._gravity_mobject is not None else []),
         )
 
     def _equation_display(self):  # type: ignore[no-untyped-def]
-        lagrangian = sp.simplify(
-            self._kinetic - self._potential
+        show_lagrangian, show_eom = self._equation_sections()
+
+        if not show_lagrangian and not show_eom:
+            return None
+
+        functions, time = self._equation_coordinate_functions(
+            dot_notation=self.equation_dot_notation,
         )
-        equations = self.equations_of_motion()
-        display = VGroup(
-            MathTex(
-                r"\mathcal{L} = " + sp.latex(lagrangian),
-                color=BLACK,
-            ),
-            *[
+
+        lagrangian = sp.simplify(
+            self._lagrangian_with_time_functions(
+                functions,
+                time,
+            )
+        )
+
+        equations = self._euler_lagrange_equations(
+            functions,
+            lagrangian,
+            time,
+        )
+
+        lines: list[object] = []
+
+        if show_lagrangian:
+            lines.append(
                 MathTex(
-                    sp.latex(equation),
+                    r"\mathcal{L} = "
+                    + self._latex_for_display(lagrangian),
+                    color=BLACK,
+                )
+            )
+
+        if show_eom:
+            lines.extend(
+                MathTex(
+                    self._latex_for_display(equation),
                     color=BLACK,
                 )
                 for equation in equations
-            ],
-        ).arrange(
+            )
+
+        display = VGroup(*lines).arrange(
             direction=np.array((0.0, -1.0, 0.0)),
             aligned_edge=np.array((-1.0, 0.0, 0.0)),
             buff=0.08,
         )
-        display.scale(0.28)
+        display.scale(0.5)
         if display.width > config.frame_width - 0.5:
             display.scale_to_fit_width(config.frame_width - 0.5)
         display.to_edge(np.array((0.0, -1.0, 0.0)), buff=0.2)
         return display
+
+    def _equation_sections(self) -> tuple[bool, bool]:
+        if self.show_equations is False:
+            return (False, False)
+
+        if self.show_equations is True:
+            return (True, True)
+
+        if isinstance(self.show_equations, str):
+            requested = {self.show_equations.lower()}
+        else:
+            requested = {
+                str(value).lower()
+                for value in self.show_equations
+            }
+
+        if requested & {"all", "everything", "both"}:
+            return (True, True)
+
+        show_lagrangian = bool(
+            requested
+            & {
+                "lagrangian",
+                "lagrange",
+                "l",
+            }
+        )
+
+        show_eom = bool(
+            requested
+            & {
+                "eom",
+                "equation",
+                "equations",
+                "motion",
+            }
+        )
+
+        if not show_lagrangian and not show_eom:
+            choices = ", ".join(sorted(requested))
+            raise ValueError(
+                "show_equations accepts False/True or values in "
+                "{'lagrangian', 'eom', 'all'}; got: "
+                f"{choices}."
+            )
+
+        return (show_lagrangian, show_eom)
+
+    def _latex_for_display(self, expression: sp.Expr | sp.Equality) -> str:
+        expression = self._normalize_display_numbers(
+            expression,
+        )
+
+        if not self.equation_dot_notation:
+            return sp.latex(expression)
+
+        from sympy.physics.vector import vlatex
+
+        return vlatex(expression)
+
+    @staticmethod
+    def _normalize_display_numbers(
+        expression: sp.Expr | sp.Equality,
+    ) -> sp.Expr | sp.Equality:
+        replacements: dict[sp.Float, sp.Integer] = {}
+
+        for value in expression.atoms(sp.Float):
+            nearest_integer = int(
+                round(float(value))
+            )
+
+            if abs(float(value) - nearest_integer) < 1e-10:
+                replacements[value] = sp.Integer(nearest_integer)
+
+        if not replacements:
+            return expression
+
+        return expression.xreplace(replacements)
+
+    def _gravity_indicator(self):  # type: ignore[no-untyped-def]
+        gravity_vector = np.array(
+            (*self.fields[0].vector, 0.0),
+            dtype=float,
+        )
+
+        magnitude = np.linalg.norm(
+            gravity_vector[:2]
+        )
+
+        if magnitude < 1e-8:
+            direction = np.array((0.0, -1.0, 0.0))
+        else:
+            direction = gravity_vector / magnitude
+
+        start = np.array((0.0, 0.0, 0.0))
+        end = start + 0.4 * direction
+        perpendicular = np.array(
+            (
+                -direction[1],
+                direction[0],
+                0.0,
+            )
+        )
+
+        arrow = Arrow(
+            start=start,
+            end=end,
+            color=BLACK,
+            buff=0,
+            stroke_width=2,
+            max_tip_length_to_length_ratio=0.3,
+        )
+
+        label = MathTex(
+            "g",
+            color=BLACK,
+        ).scale(0.6)
+
+        label.move_to(
+            end
+            + 0.1 * direction
+            + 0.1 * perpendicular
+        )
+
+        indicator = VGroup(
+            arrow,
+            label,
+        )
+
+        indicator.to_corner(
+            np.array((1.0, 1.0, 0.0)),
+            buff=0.35,
+        )
+
+        return indicator
 
     # ------------------------------------------------------------------
     # Wall visual
@@ -1510,6 +2092,144 @@ class System(VGroup):
         }[
             visualization.quantity
         ]
+
+    @staticmethod
+    def _normalize_2d(
+        vector: np.ndarray,
+    ) -> np.ndarray:
+        length = np.linalg.norm(vector)
+        if length < 1e-8:
+            return np.zeros(2)
+        return vector / length
+
+    @staticmethod
+    def _signed_angle(
+        reference: np.ndarray,
+        current: np.ndarray,
+    ) -> float:
+        cross = reference[0] * current[1] - reference[1] * current[0]
+        dot = reference[0] * current[0] + reference[1] * current[1]
+        return float(np.arctan2(cross, dot))
+
+    def _rod_direction_from_pivot(
+        self,
+        rod: Rod,
+        pivot: AttachmentPoint,
+        geometry: dict[object, tuple[float, float]],
+    ) -> np.ndarray:
+        other = rod.end if rod.start is pivot else rod.start
+        pivot_point = np.array(
+            geometry[pivot],
+            dtype=float,
+        )
+        other_point = np.array(
+            geometry[other],
+            dtype=float,
+        )
+        return self._normalize_2d(other_point - pivot_point)
+
+    def _coordinate_reference_direction(
+        self,
+        specification: _HingeCoordinateVisual,
+        geometry: dict[object, tuple[float, float]],
+    ) -> np.ndarray:
+        if specification.parent_rod is None:
+            if (
+                specification.wall is not None
+                and specification.wall.orientation == "vertical"
+            ):
+                return np.array((0.0, 1.0))
+
+            return np.array((1.0, 0.0))
+
+        return self._rod_direction(
+            specification.parent_rod,
+            geometry,
+        )
+
+    def _coordinate_current_direction(
+        self,
+        specification: _HingeCoordinateVisual,
+        geometry: dict[object, tuple[float, float]],
+    ) -> np.ndarray:
+        return self._rod_direction(specification.child_rod, geometry)
+
+    def _rod_direction(
+        self,
+        rod: Rod,
+        geometry: dict[object, tuple[float, float]],
+    ) -> np.ndarray:
+        return self._normalize_2d(
+            np.array(geometry[rod.end], dtype=float)
+            - np.array(geometry[rod.start], dtype=float)
+        )
+
+    def _coordinate_sweep(
+        self,
+        specification: _HingeCoordinateVisual,
+        reference: np.ndarray,
+        current: np.ndarray,
+    ) -> float:
+        sweep = self._signed_angle(
+            reference,
+            current,
+        )
+
+        return float(sweep)
+
+    def _wall_angle_is_on_hatched_side(
+        self,
+        specification: _HingeCoordinateVisual,
+        reference: np.ndarray,
+        sweep: float,
+        geometry: dict[object, tuple[float, float]],
+    ) -> bool:
+        wall = specification.wall
+        if wall is None:
+            return False
+
+        start_angle = float(np.arctan2(reference[1], reference[0]))
+        midpoint_angle = start_angle + 0.5 * sweep
+        midpoint = np.array(
+            (
+                np.cos(midpoint_angle),
+                np.sin(midpoint_angle),
+            )
+        )
+
+        normal_axis = 0 if wall.orientation == "vertical" else 1
+        hatch_side = self._wall_hatch_side(wall, geometry)
+        return bool(midpoint[normal_axis] * hatch_side > 1e-8)
+
+    def _coordinate_radius(
+        self,
+        specification: _HingeCoordinateVisual,
+        geometry: dict[object, tuple[float, float]],
+    ) -> float:
+        pivot = self._visual_point(
+            geometry[specification.pivot]
+        )
+
+        distances: list[float] = []
+        for point in self._points():
+            if self._node(point) != self._node(specification.pivot):
+                continue
+
+            owner = point.owner
+            if isinstance(owner, Rod):
+                other = owner.end if point is owner.start else owner.start
+                other_point = self._visual_point(
+                    geometry[other]
+                )
+                distances.append(
+                    float(np.linalg.norm(other_point - pivot))
+                )
+
+        positive = [value for value in distances if value > 1e-8]
+        if not positive:
+            return 0.35
+
+        return float(np.clip(min(positive) * 0.35, 0.22, 0.55))
 
     # ------------------------------------------------------------------
     # Attachment dots
@@ -1804,6 +2524,125 @@ class System(VGroup):
                     geometry[mass]
                 )
             )
+
+        # --------------------------------------------------------------
+        # Coordinate visuals (hinge rotations)
+        # --------------------------------------------------------------
+
+        for coordinate, group in self._coordinate_mobjects.items():
+            specification = self._hinge_coordinate_visuals[
+                coordinate
+            ]
+
+            reference = self._coordinate_reference_direction(
+                specification,
+                geometry,
+            )
+
+            current = self._coordinate_current_direction(
+                specification,
+                geometry,
+            )
+
+            if np.linalg.norm(reference) < 1e-8 or np.linalg.norm(current) < 1e-8:
+                group.set_opacity(0)
+                continue
+
+            sweep = self._coordinate_sweep(
+                specification,
+                reference,
+                current,
+            )
+
+            if abs(sweep) < 1e-6:
+                sweep = 1e-6
+
+            if self._wall_angle_is_on_hatched_side(
+                specification,
+                reference,
+                sweep,
+                geometry,
+            ):
+                reference = -reference
+                current = -current
+
+            center = self._visual_point(
+                geometry[specification.pivot]
+            )
+
+            radius = self._coordinate_radius(
+                specification,
+                geometry,
+            )
+
+            reference_3d = np.array(
+                (
+                    reference[0],
+                    reference[1],
+                    0.0,
+                )
+            )
+
+            current_3d = np.array(
+                (
+                    current[0],
+                    current[1],
+                    0.0,
+                )
+            )
+
+            start_angle = float(
+                np.arctan2(
+                    reference[1],
+                    reference[0],
+                )
+            )
+
+            arc = Arc(
+                radius=radius,
+                start_angle=start_angle,
+                angle=sweep,
+                arc_center=center,
+                color=BLACK,
+                stroke_width=2,
+                fill_opacity=0,
+            )
+
+            group[0].become(arc)
+
+            radial_extension = 0.1
+
+            group[1].put_start_and_end_on(
+                center,
+                center + (radius + radial_extension) * reference_3d,
+            )
+
+            group[2].put_start_and_end_on(
+                center,
+                center + (radius + radial_extension) * current_3d,
+            )
+
+            mid_angle = start_angle + 0.5 * sweep
+            label_radius = radius + 0.16
+
+            group[3].move_to(
+                center
+                + np.array(
+                    (
+                        np.cos(mid_angle),
+                        np.sin(mid_angle),
+                        0.0,
+                    )
+                )
+                * label_radius
+            )
+
+            # Keep arc as an unfilled curve while showing stroke and label.
+            group[0].set_stroke(opacity=1)
+            group[0].set_fill(opacity=0)
+            group[1].set_stroke(opacity=1)
+            group[2].set_stroke(opacity=1)
+            group[3].set_opacity(1)
 
         # --------------------------------------------------------------
         # Motion vectors
